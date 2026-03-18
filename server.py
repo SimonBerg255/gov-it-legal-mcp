@@ -1,4 +1,5 @@
 from fastmcp import FastMCP
+from mcp.server.fastmcp import Icon
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -10,6 +11,10 @@ from tools import (
 )
 
 ####### SERVER #######
+
+icon = Icon(
+    src="https://raw.githubusercontent.com/SimonBerg255/gov-it-legal-mcp/main/icon.png",
+)
 
 mcp = FastMCP(
     name="Italian Legal Research Server",
@@ -26,6 +31,7 @@ mcp = FastMCP(
     ),
     version="1.0.0",
     website_url="https://www.normattiva.it",
+    icons=[icon],
 )
 
 ####### TOOLS #######
