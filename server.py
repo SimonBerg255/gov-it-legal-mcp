@@ -1,14 +1,6 @@
-import os
-
-from dotenv import load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.jwt import JWTVerifier
-from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
-
-load_dotenv()
+from starlette.responses import PlainTextResponse
 
 from tools import (
     search_legislation,
@@ -16,39 +8,6 @@ from tools import (
     search_court_rulings,
     get_ruling_text,
 )
-
-####### AUTH #######
-
-verifier = JWTVerifier(
-    public_key=os.getenv("MCP_SERVER_JWT_SECRET"),
-    issuer=os.getenv("MCP_SERVER_JWT_ISSUER", ""),
-    audience=os.getenv("MCP_SERVER_JWT_AUDIENCE", ""),
-    algorithm="HS256",
-)
-
-####### MIDDLEWARE #######
-
-
-class IPAllowlistMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, allowed_ips: list[str]):
-        super().__init__(app)
-        self.allowed_ips = set(allowed_ips)
-        self.allow_all = "*" in self.allowed_ips
-
-    async def dispatch(self, request, call_next):
-        if self.allow_all:
-            return await call_next(request)
-        client_ip = request.client.host if request.client else None
-        if client_ip not in self.allowed_ips:
-            return JSONResponse(
-                status_code=403,
-                content={"error": "Forbidden", "your_ip": client_ip},
-            )
-        return await call_next(request)
-
-
-ALLOWED_IPS = ["*"]  # open for development; restrict in production
-middleware = [Middleware(IPAllowlistMiddleware, allowed_ips=ALLOWED_IPS)]
 
 ####### SERVER #######
 
@@ -67,7 +26,6 @@ mcp = FastMCP(
     ),
     version="1.0.0",
     website_url="https://www.normattiva.it",
-    auth=verifier,
 )
 
 ####### TOOLS #######
@@ -86,6 +44,6 @@ async def health_check(request: Request) -> PlainTextResponse:
 
 
 ####### APP #######
-# Run with: uvicorn server:app --host 0.0.0.0 --port 8000
+# Run with: uvicorn server:app --host 0.0.0.0 --port $PORT
 
-app = mcp.http_app(middleware=middleware)
+app = mcp.http_app()
