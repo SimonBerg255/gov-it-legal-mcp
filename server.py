@@ -45,5 +45,6 @@ async def health_check(request: Request) -> PlainTextResponse:
 
 ####### APP #######
 # Run with: uvicorn server:app --host 0.0.0.0 --port $PORT
+# No authentication — open access
 
 app = mcp.http_app()
