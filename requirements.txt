@@ -4,5 +4,4 @@ httpx>=0.28.0
 beautifulsoup4>=4.13.0
 lxml>=5.3.0
 normattiva2md>=2.1.0
-python-dotenv>=1.0.0
 uvicorn>=0.38.0
