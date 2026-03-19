@@ -450,23 +450,33 @@ async def _normattiva_search(
 async def get_legislation_text(
     act_url: str,
     article: str = None,
+    articles: str = None,
     version: str = "vigente",
 ) -> dict:
     """
-    Retrieve the full text (or a specific article) of an Italian law from Normattiva.
+    Retrieve Italian law text from Normattiva — single article, article range, or full act.
 
-    Uses the normattiva2md library to fetch the official Akoma Ntoso XML and convert
-    it to readable Markdown. The text returned is the consolidated (vigente) version
-    by default, including all subsequent amendments.
+    IMPORTANT USAGE GUIDANCE FOR LARGE LAWS:
+    Major codes (Codice Appalti, Codice Civile, TUEL, CAD, etc.) contain hundreds of
+    articles and will exceed context limits if fetched in full. Always prefer targeted
+    retrieval: use `article` for a single article, or `articles` for a range/selection.
+    When no article is specified, only the first 25 000 characters are returned along
+    with a full table of contents so you can identify and request the relevant articles.
 
     Args:
         act_url: Normattiva URL or URN string from search_legislation results.
                  Formats accepted:
                    - Full URL: "https://www.normattiva.it/uri-res/N2Ls?urn:nir:stato:decreto.legislativo:2013-03-14;33"
                    - URN string: "urn:nir:stato:decreto.legislativo:2013-03-14;33"
-        article: Optional article number to retrieve a specific article.
+        article: Single article number to retrieve.
                  Examples: "5", "22", "6-bis", "22bis", "3ter"
-                 If not provided, returns the full act text.
+        articles: Range or selection of articles in one call.
+                  Examples:
+                    "1-10"       → articles 1 through 10
+                    "1,5,22,45"  → articles 1, 5, 22 and 45
+                    "44-50,117"  → articles 44 through 50 plus 117
+                  Fetches each article in parallel and concatenates results.
+                  Maximum 30 articles per call to avoid timeout.
         version: Version of the text to retrieve:
                  "vigente" (default) — current consolidated text with all amendments
                  "originale" — original published text without amendments
@@ -476,34 +486,168 @@ async def get_legislation_text(
         Dict with keys:
           - title: Official title of the act
           - version: Version retrieved
-          - article: Article number if specified
-          - text: Full text in Markdown format (includes YAML frontmatter with metadata)
+          - article / articles: which article(s) were retrieved
+          - text: Law text in Markdown format
           - source_url: The Normattiva URL used
-          - length: Character count of the text
+          - total_length: Full character count before any truncation
+          - truncated: True if the text was cut to fit context limits
+          - table_of_contents: Article index (present when truncated or no article specified)
+          - navigation_hint: How to request more content (present when truncated)
           - error: Set only on failure, with error description
     """
     from normattiva2md import convert_url
 
     url = _normalize_normattiva_url(act_url, version)
+
+    # ── Branch 1: article range / selection ──────────────────────────────────
+    if articles and not article:
+        article_nums = _parse_article_range(articles)
+        if not article_nums:
+            return {"error": f"Could not parse articles parameter: '{articles}'", "source_url": url}
+
+        article_nums = article_nums[:30]  # hard cap — avoid timeout
+
+        async def _fetch_one(num: str) -> str:
+            norm = _normalize_article(num)
+            try:
+                res = await asyncio.to_thread(convert_url, url, article=norm)
+                return res.markdown or ""
+            except Exception:
+                return ""
+
+        parts = await asyncio.gather(*[_fetch_one(n) for n in article_nums])
+        combined = "\n\n---\n\n".join(p for p in parts if p)
+        title = ""
+        try:
+            first_res = await asyncio.to_thread(convert_url, url, article=_normalize_article(article_nums[0]))
+            title = first_res.title or ""
+        except Exception:
+            pass
+
+        return {
+            "title": title,
+            "version": version,
+            "articles": articles,
+            "articles_fetched": len([p for p in parts if p]),
+            "text": combined,
+            "source_url": url,
+            "total_length": len(combined),
+            "truncated": False,
+        }
+
+    # ── Branch 2: single article ──────────────────────────────────────────────
     article_norm = _normalize_article(article)
+    if article_norm:
+        try:
+            result = await asyncio.to_thread(convert_url, url, article=article_norm)
+            text = result.markdown or ""
+            if not text:
+                return {"error": "No text returned from Normattiva", "source_url": url}
+            return {
+                "title": result.title or "",
+                "version": version,
+                "article": article_norm,
+                "text": text,
+                "source_url": url,
+                "total_length": len(text),
+                "truncated": False,
+            }
+        except Exception as e:
+            logger.warning(f"normattiva2md failed for {url} art {article_norm}: {e}. Trying fallback.")
+            return await _legislation_text_fallback(url, article_norm, version)
+
+    # ── Branch 3: full act — apply smart cap ─────────────────────────────────
+    FULL_ACT_CAP = 25_000  # characters — safe ceiling for any context window
 
     try:
-        result = await asyncio.to_thread(convert_url, url, article=article_norm)
+        result = await asyncio.to_thread(convert_url, url, article=None)
         text = result.markdown or ""
         if not text:
             return {"error": "No text returned from Normattiva", "source_url": url}
 
+        title = result.title or ""
+        total_len = len(text)
+        toc = _extract_toc(text)
+
+        if total_len <= FULL_ACT_CAP:
+            return {
+                "title": title,
+                "version": version,
+                "article": None,
+                "text": text,
+                "source_url": url,
+                "total_length": total_len,
+                "truncated": False,
+                "table_of_contents": toc,
+            }
+
+        # Text exceeds cap — return truncated + TOC + navigation hint
+        truncated_text = text[:FULL_ACT_CAP]
+        # Trim to the last complete line so the cut doesn't land mid-sentence
+        last_newline = truncated_text.rfind("\n")
+        if last_newline > FULL_ACT_CAP * 0.9:
+            truncated_text = truncated_text[:last_newline]
+
+        article_count = len(re.findall(r"^#{1,3}\s+Art", text, re.MULTILINE | re.IGNORECASE))
+
         return {
-            "title": result.title or "",
+            "title": title,
             "version": version,
-            "article": article_norm,
-            "text": text,
+            "article": None,
+            "text": truncated_text,
             "source_url": url,
-            "length": len(text),
+            "total_length": total_len,
+            "truncated": True,
+            "chars_returned": len(truncated_text),
+            "article_count": article_count,
+            "table_of_contents": toc,
+            "navigation_hint": (
+                f"This law has {article_count} articles ({total_len:,} chars total). "
+                f"Only the first {len(truncated_text):,} chars are shown. "
+                "Use the `articles` parameter to fetch specific sections, e.g.:\n"
+                "  articles='1-20'  → first 20 articles\n"
+                "  articles='44-60' → articles on a specific topic\n"
+                "  articles='1,5,22,45,117' → specific articles by number\n"
+                "Consult the table_of_contents field to identify relevant article numbers."
+            ),
         }
+
     except Exception as e:
         logger.warning(f"normattiva2md failed for {url}: {e}. Trying fallback.")
-        return await _legislation_text_fallback(url, article_norm, version)
+        return await _legislation_text_fallback(url, None, version)
+
+
+def _parse_article_range(articles_str: str) -> list[str]:
+    """
+    Parse an articles specification into a flat list of article number strings.
+    "1-10"       → ["1","2",...,"10"]
+    "1,5,22"     → ["1","5","22"]
+    "44-46,117"  → ["44","45","46","117"]
+    Non-numeric article suffixes (bis, ter) are not expanded in ranges.
+    """
+    result: list[str] = []
+    for part in re.split(r",\s*", articles_str.strip()):
+        part = part.strip()
+        range_m = re.match(r"^(\d+)-(\d+)$", part)
+        if range_m:
+            start, end = int(range_m.group(1)), int(range_m.group(2))
+            if end >= start and (end - start) <= 100:
+                result.extend(str(n) for n in range(start, end + 1))
+        elif re.match(r"^\d+\w*$", part):
+            result.append(part)
+    return result
+
+
+def _extract_toc(markdown: str) -> str:
+    """Extract article headings from Markdown to build a compact table of contents."""
+    toc_lines: list[str] = []
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if re.match(r"^#{1,3}\s+Art", stripped, re.IGNORECASE):
+            # Normalise to plain text, remove excess hashes
+            clean = re.sub(r"^#+\s*", "", stripped)
+            toc_lines.append(clean)
+    return "\n".join(toc_lines) if toc_lines else ""
 
 
 def _normalize_normattiva_url(act_url: str, version: str = "vigente") -> str:
@@ -556,15 +700,33 @@ async def _legislation_text_fallback(url: str, article: str, version: str) -> di
     title_tag = soup.find("h1") or soup.title
     title = title_tag.get_text(strip=True) if title_tag else ""
 
-    return {
+    FULL_ACT_CAP = 25_000
+    total_len = len(text)
+    toc = _extract_toc(text)
+    truncated = not article and total_len > FULL_ACT_CAP
+    display_text = text[:FULL_ACT_CAP] if truncated else text
+
+    result = {
         "title": title,
         "version": version,
         "article": article,
-        "text": text[:60000],
+        "text": display_text,
         "source_url": url,
-        "length": len(text),
+        "total_length": total_len,
+        "truncated": truncated,
         "note": "Fallback HTML extraction (normattiva2md unavailable for this request)",
     }
+    if truncated:
+        article_count = len(re.findall(r"^Art\.", text, re.MULTILINE))
+        result["article_count"] = article_count
+        result["table_of_contents"] = toc
+        result["navigation_hint"] = (
+            f"Law has ~{article_count} articles ({total_len:,} chars). "
+            "Use articles='1-20' or articles='44,45,46' to fetch specific sections."
+        )
+    elif toc:
+        result["table_of_contents"] = toc
+    return result
 
 
 # ---------------------------------------------------------------------------
