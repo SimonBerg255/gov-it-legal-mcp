@@ -1095,8 +1095,14 @@ async def _fetch_ruling_html_from_metadata(
     using OpenGA metadata. Tries multiple nomeFile suffixes.
     Returns raw HTML string or None if not found.
     """
-    # Suffixes in order of likelihood
-    for suffix in ["_01", "_00", "_11", "_20", "_02", "_10"]:
+    # Suffix order is schema-dependent (confirmed by live testing):
+    #   CdS rulings consistently use _11
+    #   TAR rulings consistently use _01
+    if schema == "cds":
+        suffixes = ["_11", "_01", "_00", "_20", "_02", "_10"]
+    else:
+        suffixes = ["_01", "_11", "_00", "_20", "_02", "_10"]
+    for suffix in suffixes:
         url = (
             f"{GA_DOC_HTML_BASE}"
             f"?nodeRef=&schema={schema}&nrg={nrg}"
