@@ -6,13 +6,19 @@ Data sources:
   numbered regulatory acts from 1861 to present. Access via URN URLs + normattiva2md.
 - OpenGA (openga.giustizia-amministrativa.it): CKAN-based open data portal for TAR
   and Consiglio di Stato rulings. Provides metadata JSON (no full text).
+- giustizia-amministrativa.it / mdp.giustizia-amministrativa.it: Official GA portal
+  serving full ruling text as HTML via the dcsnprr Liferay portlet search.
 
-Research findings (2026-03-17):
+Research findings (2026-03-17 / 2026-03-19):
   - normattiva2md v2.1.10 works well for direct URL fetch + AKN XML conversion.
   - No public Normattiva REST API (pre.api.normattiva.it unreachable, api.normattiva.it 404).
   - Normattiva search requires POST → redirect → session-based results page.
   - OpenGA: 436 packages, 31 courts, JSON contains 17 metadata fields, NO full text.
   - CdS is under org 'cds', all TAR courts under 'tar-{location}-sentenze'.
+  - GA full text: search via POST to /web/guest/dcsnprr (Liferay portlet, needs session
+    cookie + p_auth CSRF token extracted fresh per session). Results include direct
+    mdp.giustizia-amministrativa.it/visualizzah2/ URLs. OpenGA NUMERO_RICORSO = nrg
+    param, enabling direct URL construction from OpenGA metadata.
 """
 
 import asyncio
@@ -37,6 +43,79 @@ HEADERS = {
 
 OPENGA_BASE = "https://openga.giustizia-amministrativa.it"
 NORMATTIVA_BASE = "https://www.normattiva.it"
+
+# GA portal — full ruling text
+GA_SEARCH_URL = "https://www.giustizia-amministrativa.it/web/guest/dcsnprr"
+GA_DOC_HTML_BASE = "https://mdp.giustizia-amministrativa.it/visualizzah2/"
+# Stable Liferay portlet instance ID (extracted dynamically but this is the fallback)
+GA_PORTLET_FALLBACK = "decisioni_pareri_web_DecisioniPareriWebPortlet_INSTANCE_XKc17mrB8J10"
+
+# OpenGA NOME_SEDE → GA portal schema code (Italian province codes)
+SEDE_TO_SCHEMA: dict[str, str] = {
+    "TAR LAZIO - ROMA": "tar_rm",
+    "TAR LAZIO - LATINA": "tar_lt",
+    "TAR LOMBARDIA - MILANO": "tar_mi",
+    "TAR LOMBARDIA - BRESCIA": "tar_bs",
+    "TAR CAMPANIA - NAPOLI": "tar_na",
+    "TAR CAMPANIA - SALERNO": "tar_sa",
+    "TAR TOSCANA - FIRENZE": "tar_fi",
+    "TAR PIEMONTE - TORINO": "tar_to",
+    "TAR VENETO - VENEZIA": "tar_ve",
+    "TAR PUGLIA - BARI": "tar_ba",
+    "TAR PUGLIA - LECCE": "tar_le",
+    "TAR SICILIA - PALERMO": "tar_pa",
+    "TAR SICILIA - CATANIA": "tar_ct",
+    "TAR EMILIA ROMAGNA - BOLOGNA": "tar_bo",
+    "TAR EMILIA-ROMAGNA - BOLOGNA": "tar_bo",
+    "TAR EMILIA ROMAGNA - PARMA": "tar_pr",
+    "TAR LIGURIA - GENOVA": "tar_ge",
+    "TAR MARCHE - ANCONA": "tar_an",
+    "TAR SARDEGNA - CAGLIARI": "tar_ca",
+    "TAR ABRUZZO - L'AQUILA": "tar_aq",
+    "TAR ABRUZZO - PESCARA": "tar_pe",
+    "TAR CALABRIA - CATANZARO": "tar_cz",
+    "TAR CALABRIA - REGGIO CALABRIA": "tar_rc",
+    "TAR BASILICATA - POTENZA": "tar_pz",
+    "TAR MOLISE - CAMPOBASSO": "tar_cb",
+    "TAR UMBRIA - PERUGIA": "tar_pg",
+    "TAR VALLE D'AOSTA - AOSTA": "tar_ao",
+    "TAR FRIULI VENEZIA GIULIA - TRIESTE": "tar_ts",
+    "TRGA - TRENTO": "tar_tn",
+    "TRGA - BOLZANO": "tar_bz",
+    "CdS GIURISDIZIONALE - ROMA": "cds",
+    "CONSIGLIO DI STATO": "cds",
+}
+
+# Our court key → GA portal sedeProvvedimenti POST value
+COURT_TO_SEDE: dict[str, str] = {
+    "tar_lazio": "Roma",
+    "tar_lombardia": "Milano",
+    "tar_campania": "Napoli",
+    "tar_toscana": "Firenze",
+    "tar_piemonte": "Torino",
+    "tar_veneto": "Venezia",
+    "tar_puglia": "Bari",
+    "tar_sicilia": "Palermo",
+    "tar_emilia_romagna": "Bologna",
+    "tar_liguria": "Genova",
+    "tar_marche": "Ancona",
+    "tar_sardegna": "Cagliari",
+    "tar_abruzzo": "L",          # L'Aquila abbreviated in GA form
+    "tar_calabria": "Catanzaro",
+    "tar_basilicata": "Potenza",
+    "tar_molise": "Campobasso",
+    "tar_umbria": "Perugia",
+    "tar_friuli_venezia_giulia": "Trieste",
+    "tar_lazio_latina": "Latina",
+    "tar_lombardia_brescia": "Brescia",
+    "tar_sicilia_catania": "Catania",
+    "tar_campania_salerno": "Salerno",
+    "tar_puglia_lecce": "Lecce",
+    "tar_emilia_romagna_parma": "Parma",
+    "tar_calabria_reggio_calabria": "Reggio Calabria",
+    "consiglio_di_stato": "Consiglio di Stato",
+    "cds": "Consiglio di Stato",
+}
 
 ITALIAN_MONTHS = {
     "gennaio": "01", "febbraio": "02", "marzo": "03", "aprile": "04",
@@ -703,83 +782,353 @@ def _format_ruling(record: dict, package_id: str, year: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GA portal helpers — full ruling text from giustizia-amministrativa.it
+# ---------------------------------------------------------------------------
+
+def _extract_portlet_id(html: str) -> str:
+    """Extract Liferay portlet instance ID from page HTML, fall back to known value."""
+    m = re.search(r"decisioni_pareri_web_DecisioniPareriWebPortlet_INSTANCE_(\w+)", html)
+    return m.group(0) if m else GA_PORTLET_FALLBACK
+
+
+def _extract_p_auth(html: str) -> str | None:
+    """Extract Liferay p_auth CSRF token from page HTML."""
+    m = re.search(r'Liferay\.authToken\s*=\s*["\']([^"\']+)["\']', html)
+    if m:
+        return m.group(1)
+    m = re.search(r'p_auth=([a-zA-Z0-9_\-]+)', html)
+    return m.group(1) if m else None
+
+
+def _sede_to_schema(nome_sede: str) -> str | None:
+    """Map OpenGA NOME_SEDE string to GA portal schema code."""
+    # Exact match first
+    schema = SEDE_TO_SCHEMA.get(nome_sede.strip().upper())
+    if schema:
+        return schema
+    # Partial match on city name
+    upper = nome_sede.upper()
+    for key, val in SEDE_TO_SCHEMA.items():
+        if key in upper or upper in key:
+            return val
+    return None
+
+
+async def _ga_search_session(
+    client: httpx.AsyncClient,
+    query: str,
+    sede: str = "",
+    year: int = None,
+    ruling_type: str = "Sentenza",
+    page_size: int = 20,
+) -> list[dict]:
+    """
+    Run a full-text search on the GA portal.
+    Returns list of result dicts with visualizza_url, ruling_number, schema, nrg.
+    """
+    # Step 1: GET the search page → extract session cookie + p_auth + portlet ID
+    try:
+        page_resp = await client.get(
+            GA_SEARCH_URL,
+            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml"},
+        )
+        page_resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"GA portal GET failed: {e}")
+        return []
+
+    p_auth = _extract_p_auth(page_resp.text)
+    portlet_id = _extract_portlet_id(page_resp.text)
+    ns = f"_{portlet_id}_"  # portlet namespace prefix for form fields
+
+    if not p_auth:
+        logger.warning("Could not extract p_auth from GA portal page")
+        return []
+
+    # Step 2: POST search form
+    action_url = (
+        f"{GA_SEARCH_URL}"
+        f"?p_p_id={portlet_id}"
+        f"&p_p_lifecycle=1&p_p_state=normal&p_p_mode=view"
+        f"&{ns}javax.portlet.action=search"
+        f"&p_auth={p_auth}"
+    )
+    data = {
+        f"{ns}searchtextProvvedimenti": query,
+        f"{ns}isAdvancedSearch": "false",
+        f"{ns}pageSize": str(page_size),
+        f"{ns}TipoProvvedimentoItem": ruling_type or "",
+    }
+    if sede:
+        data[f"{ns}sedeProvvedimenti"] = sede
+    if year:
+        data[f"{ns}DataYearItem"] = str(year)
+
+    try:
+        search_resp = await client.post(
+            action_url,
+            data=data,
+            headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+        )
+        search_resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"GA portal POST failed: {e}")
+        return []
+
+    return _parse_ga_results(search_resp.text)
+
+
+def _parse_ga_results(html: str) -> list[dict]:
+    """Parse GA portal search results page into structured records."""
+    soup = BeautifulSoup(html, "lxml")
+    results = []
+
+    for article in soup.find_all("article", class_="ricerca--item"):
+        # Main link with data attributes and visualizza URL
+        anchor = article.find("a", href=re.compile(r"mdp\.giustizia-amministrativa\.it"))
+        if not anchor:
+            continue
+
+        href = anchor.get("href", "")
+        schema = anchor.get("data-sede", "")
+        nrg = anchor.get("data-nrg", "")
+
+        # Convert /visualizza/ → /visualizzah2/ for HTML output
+        html_url = href.replace("/visualizza/", "/visualizzah2/")
+
+        # Extract ruling metadata from article text
+        text = re.sub(r"\s+", " ", article.get_text(" ", strip=True))
+        ruling_num_m = re.search(r"numero provv\.?:?\s*(\d+)", text, re.IGNORECASE)
+        ruling_number = ruling_num_m.group(1) if ruling_num_m else ""
+
+        tipo_m = re.search(r"^(SENTENZA(?:\s+BREVE)?|ORDINANZA|DECRETO|PARERE)", text, re.IGNORECASE)
+        ruling_type = tipo_m.group(1) if tipo_m else ""
+
+        sede_m = re.search(r"sede di\s+([^,]+),\s*sezione\s+([^,]+),", text, re.IGNORECASE)
+        court = sede_m.group(1).strip() if sede_m else ""
+        section = sede_m.group(2).strip() if sede_m else ""
+
+        results.append({
+            "ruling_number": ruling_number,
+            "nrg": nrg,
+            "schema": schema,
+            "court": court,
+            "section": section,
+            "ruling_type": ruling_type,
+            "visualizza_url": html_url,
+            "source_url": html_url,
+        })
+
+    return results
+
+
+async def _fetch_ruling_html_from_metadata(
+    client: httpx.AsyncClient,
+    schema: str,
+    nrg: str,
+    ruling_number: str,
+) -> str | None:
+    """
+    Try to fetch ruling HTML directly from mdp.giustizia-amministrativa.it
+    using OpenGA metadata. Tries multiple nomeFile suffixes.
+    Returns raw HTML string or None if not found.
+    """
+    # Suffixes in order of likelihood
+    for suffix in ["_01", "_00", "_11", "_20", "_02", "_10"]:
+        url = (
+            f"{GA_DOC_HTML_BASE}"
+            f"?nodeRef=&schema={schema}&nrg={nrg}"
+            f"&nomeFile={ruling_number}{suffix}.html&subDir=Provvedimenti"
+        )
+        try:
+            resp = await client.get(url, timeout=20)
+            if resp.status_code == 200 and len(resp.text) > 2000:
+                # Validate it's a real ruling — GA 404s return HTTP 200 with short page
+                if any(kw in resp.text for kw in ["P.Q.M", "FATTO", "DIRITTO", "Provvedimento", "dispositivo"]):
+                    return resp.text
+        except Exception:
+            continue
+    return None
+
+
+def _extract_ruling_text(html: str) -> dict:
+    """
+    Parse GA portal visualizzah2 HTML and extract structured ruling text.
+    Returns dict with sections: header, fatto_diritto, dispositivo, full_text.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
+        tag.decompose()
+
+    # Try to find the main document body
+    body = (
+        soup.find("div", class_=re.compile(r"document|provvedimento|body|content", re.I))
+        or soup.find("div", id=re.compile(r"document|provvedimento|body|content", re.I))
+        or soup.body
+    )
+
+    full_text = re.sub(r"\n{3,}", "\n\n", body.get_text("\n", strip=True)) if body else ""
+
+    # Try to extract specific sections
+    text_upper = full_text.upper()
+
+    fatto_start = max(text_upper.find("FATTO E DIRITTO"), text_upper.find("IN FATTO"))
+    pqm_start = text_upper.find("P.Q.M")
+    if pqm_start == -1:
+        pqm_start = text_upper.find("PQM")
+
+    fatto_diritto = ""
+    dispositivo = ""
+
+    if fatto_start >= 0 and pqm_start > fatto_start:
+        fatto_diritto = full_text[fatto_start:pqm_start].strip()
+        dispositivo = full_text[pqm_start:].strip()
+    elif pqm_start >= 0:
+        dispositivo = full_text[pqm_start:].strip()
+        fatto_diritto = full_text[:pqm_start].strip()
+
+    return {
+        "full_text": full_text[:80000],
+        "fatto_diritto": fatto_diritto[:40000] if fatto_diritto else "",
+        "dispositivo": dispositivo[:10000] if dispositivo else "",
+        "char_count": len(full_text),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool 4: get_ruling_text
 # ---------------------------------------------------------------------------
 
 async def get_ruling_text(ruling_reference: str) -> dict:
     """
-    Retrieve all available information for an Italian administrative court ruling.
+    Retrieve the full text of an Italian administrative court ruling.
 
-    Searches cached OpenGA data (populated by previous search_court_rulings calls)
-    to find the ruling by its reference number. Since OpenGA open data contains
-    metadata only (no full text), this tool returns all 17 available metadata fields
-    plus a link to search for the full decision on giustizia-amministrativa.it.
+    Searches cached OpenGA metadata (from previous search_court_rulings calls) to
+    identify the ruling, then fetches the complete decision text directly from the
+    official GA portal (giustizia-amministrativa.it). Returns full reasoning text
+    (fatto, in diritto) and the operative section (P.Q.M. / dispositivo).
 
-    IMPORTANT: Full text of decisions is not available in the OpenGA open data portal.
-    The OGGETTO_RICORSO field provides a brief subject description only. To read the
-    full text, use the provided full_text_search_url to access the official portal.
+    If the ruling is not in cache, it falls back to a keyword search on the GA portal.
 
     Args:
         ruling_reference: Ruling identifier. Accepts:
           - Ruling number as returned by search_court_rulings (e.g. "202400196")
           - Court + number (e.g. "TAR LAZIO 202400196")
-          - Appeal number (NUMERO_RICORSO)
-          Any numeric string of 6+ digits will be matched.
+          - Appeal number / NRG (NUMERO_RICORSO, e.g. "1234/2023")
+          Any numeric string of 6+ digits will be matched against cached records.
 
     Returns:
         Dict with keys:
-          - found: True if ruling was located in cached data
+          - found: True if ruling was located
+          - full_text_available: True if complete text was retrieved from GA portal
           - court, section, ruling_number, appeal_number: identifiers
           - date, year: publication date
           - ruling_type, hearing_type, outcome, appeal_type: classification
           - subject: OGGETTO_RICORSO — brief subject description
-          - full_text_available: always False (not in open data)
-          - full_text_search_url: URL to search for full decision on GA portal
-          - openga_dataset_url: link to source dataset
-          - note: explanation of data availability
+          - full_text: complete ruling text (if available, up to 80 000 chars)
+          - fatto_diritto: fact and law sections extracted from full text
+          - dispositivo: operative section starting at P.Q.M.
+          - char_count: total character length of full text
+          - source_url: URL where full text was retrieved
+          - openga_dataset_url: link to source metadata dataset
     """
-    results = _find_in_cache(ruling_reference)
+    formatted_results = _find_in_cache(ruling_reference)
+    raw_results = _find_raw_in_cache(ruling_reference)
 
-    if results:
-        record = results[0]
-        ruling_num = record.get("ruling_number", "")
-        year = record.get("year", "")
-        return {
-            "found": True,
-            "court": record.get("court", ""),
-            "section": record.get("section", ""),
-            "ruling_number": ruling_num,
-            "appeal_number": record.get("appeal_number", ""),
-            "date": record.get("date", ""),
-            "year": year,
-            "ruling_type": record.get("ruling_type", ""),
-            "hearing_type": record.get("hearing_type", ""),
-            "outcome": record.get("outcome", ""),
-            "appeal_type": record.get("appeal_type", ""),
-            "subject": record.get("subject", ""),
-            "full_text_available": False,
-            "full_text_search_url": (
-                "https://www.giustizia-amministrativa.it/portale/pages/istituzionale/ucm"
-                f"?id=SENTENZA&q={ruling_num}&anno={year}"
-            ),
-            "openga_dataset_url": record.get("openga_dataset_url", ""),
-            "note": (
-                "OpenGA open data provides ruling metadata only. Full text is not available. "
-                "Use the full_text_search_url to locate the decision on giustizia-amministrativa.it."
-            ),
-        }
+    async with httpx.AsyncClient(
+        headers=HEADERS, follow_redirects=True, timeout=40
+    ) as client:
 
+        if formatted_results and raw_results:
+            record = formatted_results[0]
+            raw = raw_results[0]
+
+            nome_sede = raw.get("NOME_SEDE", record.get("court", ""))
+            nrg = str(raw.get("NUMERO_RICORSO", record.get("appeal_number", "")))
+            ruling_num = str(raw.get("NUMERO_PROVVEDIMENTO", record.get("ruling_number", "")))
+
+            schema = _sede_to_schema(nome_sede)
+            full_text_data = None
+            source_url = ""
+
+            # Attempt 1: direct filename construction (fast, no extra request)
+            if schema and nrg and ruling_num:
+                html = await _fetch_ruling_html_from_metadata(
+                    client, schema, nrg, ruling_num
+                )
+                if html:
+                    full_text_data = _extract_ruling_text(html)
+                    source_url = (
+                        f"{GA_DOC_HTML_BASE}?schema={schema}&nrg={nrg}"
+                        f"&nomeFile={ruling_num}_01.html&subDir=Provvedimenti"
+                    )
+
+            # Attempt 2: GA portal keyword search to find the visualizza URL
+            if not full_text_data:
+                ga_hits = await _ga_search_session(
+                    client,
+                    query=ruling_num or ruling_reference,
+                    sede=SEDE_TO_SCHEMA.get(nome_sede.upper(), ""),
+                    page_size=5,
+                )
+                for hit in ga_hits:
+                    url = hit.get("visualizza_url", "")
+                    if not url:
+                        continue
+                    try:
+                        resp = await client.get(url, timeout=30)
+                        if resp.status_code == 200 and len(resp.text) > 2000:
+                            if any(kw in resp.text for kw in ["P.Q.M", "FATTO", "DIRITTO", "dispositivo"]):
+                                full_text_data = _extract_ruling_text(resp.text)
+                                source_url = url
+                                break
+                    except Exception:
+                        continue
+
+            result: dict = {
+                "found": True,
+                "full_text_available": full_text_data is not None,
+                "court": record.get("court", ""),
+                "section": record.get("section", ""),
+                "ruling_number": record.get("ruling_number", ""),
+                "appeal_number": record.get("appeal_number", ""),
+                "date": record.get("date", ""),
+                "year": record.get("year", ""),
+                "ruling_type": record.get("ruling_type", ""),
+                "hearing_type": record.get("hearing_type", ""),
+                "outcome": record.get("outcome", ""),
+                "appeal_type": record.get("appeal_type", ""),
+                "subject": record.get("subject", ""),
+                "openga_dataset_url": record.get("openga_dataset_url", ""),
+            }
+
+            if full_text_data:
+                result.update({
+                    "full_text": full_text_data["full_text"],
+                    "fatto_diritto": full_text_data["fatto_diritto"],
+                    "dispositivo": full_text_data["dispositivo"],
+                    "char_count": full_text_data["char_count"],
+                    "source_url": source_url,
+                })
+            else:
+                result["note"] = (
+                    "Metadata retrieved from OpenGA but full text could not be fetched "
+                    "from the GA portal — the ruling may use a non-standard filename or "
+                    "the document is not yet published online. "
+                    f"Try searching directly: {GA_SEARCH_URL}"
+                )
+
+            return result
+
+    # Not found in cache at all
     return {
         "found": False,
-        "reference": ruling_reference,
         "full_text_available": False,
-        "full_text_search_url": (
-            "https://www.giustizia-amministrativa.it/portale/pages/istituzionale/ucm"
-            f"?id=SENTENZA&q={ruling_reference}"
-        ),
+        "reference": ruling_reference,
         "note": (
-            "Ruling not found in cached data. First call search_court_rulings() to load "
-            "rulings into cache, then pass the ruling_number to get_ruling_text()."
+            "Ruling not found in cached data. Call search_court_rulings() first to "
+            "load rulings into cache, then pass the ruling_number here. "
+            "Alternatively, use search_rulings_fulltext() to search by keywords directly."
         ),
     }
 
@@ -802,3 +1151,150 @@ def _find_in_cache(reference: str) -> list:
                 results.append(_format_ruling(record, pkg_id, yr))
 
     return results
+
+
+def _find_raw_in_cache(reference: str) -> list[dict]:
+    """Return raw OpenGA records matching a ruling reference (for GA portal lookups)."""
+    num_match = re.search(r"\d{6,}", reference)
+    search_num = num_match.group(0) if num_match else reference.strip()
+    results = []
+    for records in _json_cache.values():
+        for record in records:
+            prov_num = str(record.get("NUMERO_PROVVEDIMENTO", ""))
+            ricorso_num = str(record.get("NUMERO_RICORSO", ""))
+            if search_num and (search_num in prov_num or search_num in ricorso_num):
+                results.append(record)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: search_rulings_fulltext
+# ---------------------------------------------------------------------------
+
+async def search_rulings_fulltext(
+    query: str,
+    court: str = "",
+    year: int = None,
+    ruling_type: str = "Sentenza",
+    max_results: int = 3,
+) -> dict:
+    """
+    Search Italian administrative court decisions with full text via the GA portal.
+
+    Unlike search_court_rulings (which searches OpenGA metadata by court and year),
+    this tool sends a free-text keyword query directly to giustizia-amministrativa.it
+    and retrieves the complete decision text — fatto, diritto, and dispositivo — for
+    each matching ruling. Use this when you need to find decisions on a specific legal
+    topic or understand how courts have ruled on a particular issue.
+
+    Args:
+        query: Free-text search query in Italian (e.g. "accesso atti whistleblowing",
+               "silenzio inadempimento 30 giorni", "appalti pubblici subappalto").
+               More specific terms yield better results.
+        court: Optional court filter. Accepts common names such as:
+               "TAR Lazio", "TAR Lombardia", "Consiglio di Stato", "TAR Campania", etc.
+               Leave empty to search all courts.
+        year:  Optional year filter (e.g. 2023, 2024). Leave as None for all years.
+        ruling_type: Type of decision to retrieve — "Sentenza" (default), "Ordinanza",
+                     "Decreto", or "Parere".
+        max_results: How many rulings to retrieve full text for. Range 1–8, default 3.
+                     Higher values take longer (one HTTP request per ruling).
+
+    Returns:
+        Dict with:
+          - query: the search query used
+          - court_filter, year_filter, ruling_type_filter: active filters
+          - total_found: total results returned by GA portal search
+          - results_returned: number of results included (≤ max_results)
+          - results: list of dicts, each containing:
+              - court, section, ruling_type, ruling_number, nrg (appeal number)
+              - full_text_available: True if full text was successfully retrieved
+              - full_text: complete decision text (up to 80 000 chars)
+              - fatto_diritto: reasoning section (facts + law analysis)
+              - dispositivo: operative/dispositif section (P.Q.M.)
+              - char_count: text length in characters
+              - source_url: direct URL to the HTML document on the GA portal
+          - note: any relevant notes or warnings
+    """
+    # Resolve court name to GA portal sede filter value
+    sede = ""
+    if court:
+        court_lower = court.lower().strip()
+        for key, val in COURT_TO_SEDE.items():
+            if key.replace("_", " ") in court_lower or court_lower in key.replace("_", " "):
+                sede = val
+                break
+        if not sede:
+            # Attempt a loose match on value strings
+            for val in COURT_TO_SEDE.values():
+                if val.lower() in court_lower or court_lower in val.lower():
+                    sede = val
+                    break
+        if not sede:
+            sede = court  # pass through as-is; the portal may still accept it
+
+    max_results = max(1, min(8, max_results))
+
+    async with httpx.AsyncClient(
+        headers=HEADERS, follow_redirects=True, timeout=60
+    ) as client:
+        ga_results = await _ga_search_session(
+            client,
+            query=query,
+            sede=sede,
+            year=year,
+            ruling_type=ruling_type,
+            page_size=max(20, max_results * 4),
+        )
+
+        enriched: list[dict] = []
+
+        for item in ga_results:
+            if len(enriched) >= max_results:
+                break
+
+            html_url = item.get("visualizza_url", "")
+            full_text_data = None
+
+            if html_url:
+                try:
+                    resp = await client.get(html_url, timeout=35)
+                    if resp.status_code == 200 and len(resp.text) > 2000:
+                        if any(kw in resp.text for kw in ["P.Q.M", "FATTO", "DIRITTO", "dispositivo", "Provvedimento"]):
+                            full_text_data = _extract_ruling_text(resp.text)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch ruling text from {html_url}: {e}")
+
+            enriched_item = dict(item)
+            if full_text_data:
+                enriched_item.update({
+                    "full_text_available": True,
+                    "full_text": full_text_data["full_text"],
+                    "fatto_diritto": full_text_data["fatto_diritto"],
+                    "dispositivo": full_text_data["dispositivo"],
+                    "char_count": full_text_data["char_count"],
+                })
+            else:
+                enriched_item["full_text_available"] = False
+
+            enriched.append(enriched_item)
+
+    note = ""
+    if not ga_results:
+        note = (
+            "No results found on the GA portal for this query. Try broader search terms, "
+            "remove filters, or use search_court_rulings() to browse by court and year."
+        )
+    elif not enriched:
+        note = "Results were found but full text could not be retrieved. Try again or check source_url directly."
+
+    return {
+        "query": query,
+        "court_filter": sede or "all courts",
+        "year_filter": year or "all years",
+        "ruling_type_filter": ruling_type,
+        "total_found": len(ga_results),
+        "results_returned": len(enriched),
+        "results": enriched,
+        "note": note,
+    }
