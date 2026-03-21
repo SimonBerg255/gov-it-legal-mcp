@@ -7,6 +7,7 @@ from tools import (
     search_legislation,
     get_legislation_text,
     search_court_rulings,
+    summarize_court_rulings,
     get_ruling_text,
     search_rulings_fulltext,
 )
@@ -20,18 +21,30 @@ icon = Icon(
 mcp = FastMCP(
     name="Italian Legal Research Server",
     instructions=(
-        "Use this server to research Italian legislation and administrative court rulings.\n\n"
-        "Available tools:\n"
-        "- search_legislation: find laws by keyword or citation (e.g. 'd.lgs. 33/2013', 'l. 241/1990')\n"
-        "- get_legislation_text: retrieve full or article-level text of a law from Normattiva\n"
-        "- search_court_rulings: browse TAR and Consiglio di Stato decisions from OpenGA by court/year\n"
-        "- get_ruling_text: retrieve full decision text for a ruling found via search_court_rulings\n"
-        "- search_rulings_fulltext: keyword search across all courts with full decision text "
-        "(fatto, diritto, dispositivo) — use this for topic-based research\n\n"
-        "Data sources: Normattiva (normattiva.it) for official legislation; "
-        "OpenGA (openga.giustizia-amministrativa.it) for court metadata; "
-        "GA portal (giustizia-amministrativa.it) for full decision text.\n"
-        "All tools run automatically without user confirmation."
+        "Server for researching Italian legislation and administrative court rulings.\n\n"
+        "DECISION TREE — pick the right tool based on the user's question:\n\n"
+        "1. USER ASKS ABOUT A LAW (legislation, decreto, legge, codice, normativa):\n"
+        "   → search_legislation — find the law by citation or keywords\n"
+        "   → get_legislation_text — read the actual law text\n"
+        "   WORKFLOW: search first to get the URL, then get_legislation_text to read it.\n"
+        "   For large laws (Codice Appalti, TUEL, CAD): NEVER fetch full text.\n"
+        "   Use get_legislation_text with articles='1-10' or article='22' instead.\n\n"
+        "2. USER ASKS ABOUT COURT RULINGS (sentenza, decisione, giurisprudenza, TAR, CdS):\n"
+        "   a) Wants to find specific rulings → search_court_rulings (fast, metadata)\n"
+        "   b) Wants to read a ruling's text → get_ruling_text (fetches full text from GA)\n"
+        "   c) Wants topic-based research with full text → search_rulings_fulltext\n"
+        "   d) Wants statistics/counts/trends → summarize_court_rulings\n"
+        "   IMPORTANT: search_court_rulings queries must be in ITALIAN legal terms.\n"
+        "   Translate English terms: 'whistleblowing' → 'segnalazione illeciti',\n"
+        "   'procurement' → 'appalti', 'access to documents' → 'accesso atti'.\n\n"
+        "3. USER ASKS 'HOW MANY' / 'WHAT PERCENTAGE' / 'TREND' / 'COMPARISON':\n"
+        "   → summarize_court_rulings — aggregates counts by outcome, court, month, etc.\n"
+        "   Do NOT use search_court_rulings for counting — it returns individual records.\n\n"
+        "CONTEXT LIMITS: All responses are capped to fit LLM context windows.\n"
+        "If a ruling text is truncated, the response includes a navigation_hint\n"
+        "explaining how to fetch the remaining text.\n\n"
+        "Data sources: Normattiva (legislation), OpenGA (court metadata),\n"
+        "GA portal (full court decision text). All tools run without user confirmation."
     ),
     version="1.0.0",
     website_url="https://www.normattiva.it",
@@ -43,6 +56,7 @@ mcp = FastMCP(
 mcp.tool(meta={"requires_permission": False})(search_legislation)
 mcp.tool(meta={"requires_permission": False})(get_legislation_text)
 mcp.tool(meta={"requires_permission": False})(search_court_rulings)
+mcp.tool(meta={"requires_permission": False})(summarize_court_rulings)
 mcp.tool(meta={"requires_permission": False})(get_ruling_text)
 mcp.tool(meta={"requires_permission": False})(search_rulings_fulltext)
 

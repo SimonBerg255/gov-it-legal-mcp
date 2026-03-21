@@ -752,9 +752,16 @@ async def search_court_rulings(
     the appeal), which typically contains a 1-3 line description of the dispute.
 
     Args:
-        query: Keywords to search in Italian (searches ruling subject field).
-               Examples: "trasparenza accesso documenti", "appalti pubblici",
-               "segnalante whistleblowing", "decisione algoritmica"
+        query: Keywords to search in Italian (searches the OGGETTO_RICORSO field,
+               which uses formal Italian administrative law terminology).
+               Use Italian legal terms, not English. Examples:
+               - "diniego accesso atti" (not "access denial")
+               - "annullamento permesso costruire" (not "building permit")
+               - "concorso pubblico esclusione" (not "public competition")
+               - "appalti aggiudicazione" (not "procurement award")
+               - "silenzio inadempimento" (not "administrative silence")
+               - "segnalazione illeciti" (not "whistleblowing")
+               Multiple words are searched with OR logic, ranked by match count.
         court: Court filter. One of:
                "tar_lazio", "tar_lombardia", "tar_campania", "tar_toscana",
                "tar_piemonte", "tar_veneto", "tar_puglia", "tar_sicilia",
@@ -768,7 +775,7 @@ async def search_court_rulings(
               the last 3 years automatically.
         ruling_type: Filter by ruling type: "sentenza", "ordinanza", "decreto",
                      "parere". If not specified, returns all types.
-        max_results: Maximum number of results to return (default 10).
+        max_results: Maximum number of results to return (default 10, max 20).
 
     Returns:
         Dict with keys:
@@ -778,6 +785,7 @@ async def search_court_rulings(
           - results: list of dicts with court, ruling_number, appeal_number,
                      date, ruling_type, outcome, appeal_type, subject, dataset
     """
+    max_results = max(1, min(20, max_results))
     court_lower = court.lower().strip()
 
     # Determine which packages to search
@@ -940,6 +948,115 @@ def _format_ruling(record: dict, package_id: str, year: int) -> dict:
         "subject": record.get("OGGETTO_RICORSO", ""),
         "dataset": package_id,
         "openga_dataset_url": f"{OPENGA_BASE}/dataset/{package_id}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 3b: summarize_court_rulings — aggregation over OpenGA metadata
+# ---------------------------------------------------------------------------
+
+async def summarize_court_rulings(
+    query: str = "",
+    court: str = "all",
+    year: int = None,
+    group_by: str = "outcome",
+) -> dict:
+    """
+    Aggregate and summarize Italian administrative court rulings from OpenGA.
+
+    Unlike search_court_rulings (which returns individual records), this tool counts
+    and groups rulings to answer questions like:
+    - "How many access-to-information rulings were decided in 2024?"
+    - "What percentage of appeals are upheld vs rejected at Consiglio di Stato?"
+    - "Which courts handle the most procurement cases?"
+
+    Use this tool when the user asks about trends, statistics, distributions, or
+    comparisons across rulings. Do NOT use search_court_rulings for counting.
+
+    Args:
+        query: Optional keyword filter (same format as search_court_rulings).
+               Leave empty to aggregate all rulings in the court/year.
+        court: Court filter (same values as search_court_rulings).
+               Default "all" searches CdS + TAR Lazio + TAR Lombardia.
+        year:  Year to aggregate. Strongly recommended — omitting searches 3 years.
+        group_by: How to group the counts. One of:
+               "outcome"      — ACCOGLIMENTO / RIGETTO / etc. (default)
+               "ruling_type"  — SENTENZA / ORDINANZA / DECRETO
+               "court"        — by court name (useful with court="all")
+               "month"        — by publication month
+               "hearing_type" — UDIENZA PUBBLICA / CAMERA DI CONSIGLIO
+
+    Returns:
+        Dict with:
+          - query, court_filter, year_filter, group_by: echo of inputs
+          - total_matching: total records matching the query/filters
+          - total_scanned: total records scanned (may be partial if capped)
+          - groups: dict mapping group values to counts, sorted by count descending
+          - note: any warnings (e.g. partial data)
+    """
+    court_lower = court.lower().strip()
+
+    if court_lower == "all":
+        packages = ["cds-sentenze", "tar-lazio-roma-sentenze", "tar-lombardia-milano-sentenze"]
+    elif court_lower in COURT_PACKAGES:
+        packages = [COURT_PACKAGES[court_lower]]
+    else:
+        matched = [v for k, v in COURT_PACKAGES.items() if court_lower in k]
+        packages = matched[:3] if matched else ["cds-sentenze"]
+
+    current_year = datetime.now().year
+    years_to_try = [year] if year else [current_year, current_year - 1, current_year - 2]
+
+    query_terms = [t.lower() for t in re.split(r"\s+", query.strip()) if len(t) > 2] if query else []
+
+    GROUP_FIELD = {
+        "outcome": "ESITO_PROVVEDIMENTO",
+        "ruling_type": "TIPO_PROVVEDIMENTO",
+        "court": "NOME_SEDE",
+        "month": "MESE_PUBBLICAZIONE",
+        "hearing_type": "TIPO_UDIENZA",
+    }.get(group_by, "ESITO_PROVVEDIMENTO")
+
+    groups: dict[str, int] = {}
+    total_matching = 0
+    total_scanned = 0
+
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=60) as client:
+        for package_id in packages:
+            for yr in years_to_try:
+                records = await _get_openga_records(client, package_id, yr)
+                total_scanned += len(records)
+
+                for record in records:
+                    if query_terms:
+                        subject = record.get("OGGETTO_RICORSO", "").lower()
+                        if not any(t in subject for t in query_terms):
+                            continue
+
+                    total_matching += 1
+                    group_val = record.get(GROUP_FIELD, "UNKNOWN").strip()
+                    if not group_val:
+                        group_val = "UNKNOWN"
+                    groups[group_val] = groups.get(group_val, 0) + 1
+
+    # Sort by count descending
+    sorted_groups = dict(sorted(groups.items(), key=lambda x: x[1], reverse=True))
+
+    note = ""
+    if not year:
+        note = f"Aggregation covers {len(years_to_try)} years ({', '.join(str(y) for y in years_to_try)}). Specify year for single-year stats."
+    if court_lower == "all":
+        note += " Only 3 courts searched (CdS, TAR Lazio Roma, TAR Lombardia Milano) — specify court for others."
+
+    return {
+        "query": query or "(all rulings)",
+        "court_filter": court,
+        "year_filter": year,
+        "group_by": group_by,
+        "total_matching": total_matching,
+        "total_scanned": total_scanned,
+        "groups": sorted_groups,
+        "note": note.strip(),
     }
 
 
@@ -1119,16 +1236,18 @@ async def _fetch_ruling_html_from_metadata(
     return None
 
 
-def _extract_ruling_text(html: str) -> dict:
+def _extract_ruling_text(html: str, fatto_cap: int = 20_000) -> dict:
     """
     Parse GA portal visualizzah2 HTML and extract structured ruling text.
-    Returns dict with sections: header, fatto_diritto, dispositivo, full_text.
+
+    Context-safe: returns header_summary + fatto_diritto (capped) + dispositivo.
+    The full_text field is intentionally omitted — it is redundant with the
+    extracted sections and would blow up the LLM context window on long rulings.
     """
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
         tag.decompose()
 
-    # Try to find the main document body
     body = (
         soup.find("div", class_=re.compile(r"document|provvedimento|body|content", re.I))
         or soup.find("div", id=re.compile(r"document|provvedimento|body|content", re.I))
@@ -1136,14 +1255,17 @@ def _extract_ruling_text(html: str) -> dict:
     )
 
     full_text = re.sub(r"\n{3,}", "\n\n", body.get_text("\n", strip=True)) if body else ""
-
-    # Try to extract specific sections
     text_upper = full_text.upper()
 
+    # Locate section boundaries
     fatto_start = max(text_upper.find("FATTO E DIRITTO"), text_upper.find("IN FATTO"))
     pqm_start = text_upper.find("P.Q.M")
     if pqm_start == -1:
         pqm_start = text_upper.find("PQM")
+
+    # Extract a compact header summary (court, date, parties — first 500 chars)
+    header_text = full_text[:fatto_start].strip() if fatto_start > 0 else ""
+    header_summary = header_text[:500] + ("..." if len(header_text) > 500 else "")
 
     fatto_diritto = ""
     dispositivo = ""
@@ -1155,26 +1277,54 @@ def _extract_ruling_text(html: str) -> dict:
         dispositivo = full_text[pqm_start:].strip()
         fatto_diritto = full_text[:pqm_start].strip()
 
-    return {
-        "full_text": full_text[:80000],
-        "fatto_diritto": fatto_diritto[:40000] if fatto_diritto else "",
-        "dispositivo": dispositivo[:10000] if dispositivo else "",
+    total_fatto_chars = len(fatto_diritto)
+    truncated = total_fatto_chars > fatto_cap
+
+    if truncated:
+        cut = fatto_diritto[:fatto_cap]
+        last_nl = cut.rfind("\n")
+        if last_nl > fatto_cap * 0.8:
+            cut = cut[:last_nl]
+        fatto_diritto = cut
+
+    result = {
+        "header_summary": header_summary,
+        "fatto_diritto": fatto_diritto,
+        "dispositivo": dispositivo[:5000],
         "char_count": len(full_text),
+        "fatto_diritto_chars": total_fatto_chars,
+        "truncated": truncated,
     }
+
+    if truncated:
+        result["navigation_hint"] = (
+            f"The reasoning section is {total_fatto_chars:,} chars — only the first "
+            f"{len(fatto_diritto):,} chars are shown. To read the full reasoning, call "
+            "get_ruling_text again with section='fatto_diritto_full'."
+        )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Tool 4: get_ruling_text
 # ---------------------------------------------------------------------------
 
-async def get_ruling_text(ruling_reference: str) -> dict:
+async def get_ruling_text(
+    ruling_reference: str,
+    section: str = "default",
+) -> dict:
     """
-    Retrieve the full text of an Italian administrative court ruling.
+    Retrieve the text of an Italian administrative court ruling.
 
     Searches cached OpenGA metadata (from previous search_court_rulings calls) to
-    identify the ruling, then fetches the complete decision text directly from the
-    official GA portal (giustizia-amministrativa.it). Returns full reasoning text
-    (fatto, in diritto) and the operative section (P.Q.M. / dispositivo).
+    identify the ruling, then fetches the decision text from the official GA portal
+    (giustizia-amministrativa.it).
+
+    CONTEXT-AWARE: By default, returns a truncated version of the reasoning (fatto
+    + diritto, up to ~20 000 chars) plus the full operative section (P.Q.M.).
+    For long rulings this is enough to understand the legal reasoning. Use section
+    parameters to drill into specific parts when needed.
 
     If the ruling is not in cache, it falls back to a keyword search on the GA portal.
 
@@ -1184,6 +1334,15 @@ async def get_ruling_text(ruling_reference: str) -> dict:
           - Court + number (e.g. "TAR LAZIO 202400196")
           - Appeal number / NRG (NUMERO_RICORSO, e.g. "1234/2023")
           Any numeric string of 6+ digits will be matched against cached records.
+        section: Which part of the ruling to return:
+          - "default" — fatto_diritto (capped at 20 000 chars) + full dispositivo.
+            Best for understanding the ruling and answering most user questions.
+          - "fatto_diritto_full" — full reasoning section without truncation
+            (up to 60 000 chars). Use only when the default was truncated and you
+            need the remaining text.
+          - "dispositivo" — only the P.Q.M. / operative section.
+            Useful for quick outcome checks.
+          - "header" — procedural header (parties, lawyers, dates).
 
     Returns:
         Dict with keys:
@@ -1191,15 +1350,23 @@ async def get_ruling_text(ruling_reference: str) -> dict:
           - full_text_available: True if complete text was retrieved from GA portal
           - court, section, ruling_number, appeal_number: identifiers
           - date, year: publication date
-          - ruling_type, hearing_type, outcome, appeal_type: classification
-          - subject: OGGETTO_RICORSO — brief subject description
-          - full_text: complete ruling text (if available, up to 80 000 chars)
-          - fatto_diritto: fact and law sections extracted from full text
+          - ruling_type, outcome, subject: classification
+          - fatto_diritto: fact and law sections (may be truncated, see navigation_hint)
           - dispositivo: operative section starting at P.Q.M.
-          - char_count: total character length of full text
+          - char_count: total character length of full ruling
+          - truncated: True if fatto_diritto was truncated
           - source_url: URL where full text was retrieved
-          - openga_dataset_url: link to source metadata dataset
     """
+    # Determine fatto_diritto cap based on section request
+    if section == "fatto_diritto_full":
+        fatto_cap = 60_000
+    elif section == "dispositivo":
+        fatto_cap = 0
+    elif section == "header":
+        fatto_cap = 0
+    else:
+        fatto_cap = 20_000  # default — fits comfortably in any context window
+
     formatted_results = _find_in_cache(ruling_reference)
     raw_results = _find_raw_in_cache(ruling_reference)
 
@@ -1225,7 +1392,7 @@ async def get_ruling_text(ruling_reference: str) -> dict:
                     client, schema, nrg, ruling_num
                 )
                 if html:
-                    full_text_data = _extract_ruling_text(html)
+                    full_text_data = _extract_ruling_text(html, fatto_cap=fatto_cap)
                     source_url = (
                         f"{GA_DOC_HTML_BASE}?schema={schema}&nrg={nrg}"
                         f"&nomeFile={ruling_num}_01.html&subDir=Provvedimenti"
@@ -1247,7 +1414,7 @@ async def get_ruling_text(ruling_reference: str) -> dict:
                         resp = await client.get(url, timeout=30)
                         if resp.status_code == 200 and len(resp.text) > 2000:
                             if any(kw in resp.text for kw in ["P.Q.M", "FATTO", "DIRITTO", "dispositivo"]):
-                                full_text_data = _extract_ruling_text(resp.text)
+                                full_text_data = _extract_ruling_text(resp.text, fatto_cap=fatto_cap)
                                 source_url = url
                                 break
                     except Exception:
@@ -1256,28 +1423,33 @@ async def get_ruling_text(ruling_reference: str) -> dict:
             result: dict = {
                 "found": True,
                 "full_text_available": full_text_data is not None,
+                "section_requested": section,
                 "court": record.get("court", ""),
-                "section": record.get("section", ""),
+                "court_section": record.get("section", ""),
                 "ruling_number": record.get("ruling_number", ""),
                 "appeal_number": record.get("appeal_number", ""),
                 "date": record.get("date", ""),
                 "year": record.get("year", ""),
                 "ruling_type": record.get("ruling_type", ""),
-                "hearing_type": record.get("hearing_type", ""),
                 "outcome": record.get("outcome", ""),
-                "appeal_type": record.get("appeal_type", ""),
                 "subject": record.get("subject", ""),
-                "openga_dataset_url": record.get("openga_dataset_url", ""),
             }
 
             if full_text_data:
-                result.update({
-                    "full_text": full_text_data["full_text"],
-                    "fatto_diritto": full_text_data["fatto_diritto"],
-                    "dispositivo": full_text_data["dispositivo"],
-                    "char_count": full_text_data["char_count"],
-                    "source_url": source_url,
-                })
+                # Build response based on requested section
+                if section == "header":
+                    result["header_summary"] = full_text_data.get("header_summary", "")
+                elif section == "dispositivo":
+                    result["dispositivo"] = full_text_data["dispositivo"]
+                else:
+                    result["fatto_diritto"] = full_text_data["fatto_diritto"]
+                    result["dispositivo"] = full_text_data["dispositivo"]
+                    result["truncated"] = full_text_data["truncated"]
+                    if full_text_data.get("navigation_hint"):
+                        result["navigation_hint"] = full_text_data["navigation_hint"]
+                result["char_count"] = full_text_data["char_count"]
+                result["fatto_diritto_total_chars"] = full_text_data["fatto_diritto_chars"]
+                result["source_url"] = source_url
             else:
                 result["note"] = (
                     "Metadata retrieved from OpenGA but full text could not be fetched "
@@ -1365,8 +1537,9 @@ async def search_rulings_fulltext(
         year:  Optional year filter (e.g. 2023, 2024). Leave as None for all years.
         ruling_type: Type of decision to retrieve — "Sentenza" (default), "Ordinanza",
                      "Decreto", or "Parere".
-        max_results: How many rulings to retrieve full text for. Range 1–8, default 3.
-                     Higher values take longer (one HTTP request per ruling).
+        max_results: How many rulings to retrieve full text for. Range 1–5, default 3.
+                     Higher values take longer (one HTTP request per ruling) and use
+                     more context. Keep at 3 unless you specifically need more.
 
     Returns:
         Dict with:
@@ -1377,12 +1550,13 @@ async def search_rulings_fulltext(
           - results: list of dicts, each containing:
               - court, section, ruling_type, ruling_number, nrg (appeal number)
               - full_text_available: True if full text was successfully retrieved
-              - full_text: complete decision text (up to 80 000 chars)
-              - fatto_diritto: reasoning section (facts + law analysis)
+              - fatto_diritto: reasoning section (capped at ~8 000 chars per ruling)
               - dispositivo: operative/dispositif section (P.Q.M.)
-              - char_count: text length in characters
+              - char_count: total text length (use get_ruling_text to read full version)
+              - truncated: True if reasoning was truncated
               - source_url: direct URL to the HTML document on the GA portal
           - note: any relevant notes or warnings
+          For truncated results, use get_ruling_text(ruling_number) to read the full text.
     """
     # Resolve court name to GA portal sede filter value
     sede = ""
@@ -1401,7 +1575,7 @@ async def search_rulings_fulltext(
         if not sede:
             sede = court  # pass through as-is; the portal may still accept it
 
-    max_results = max(1, min(8, max_results))
+    max_results = max(1, min(5, max_results))
 
     async with httpx.AsyncClient(
         headers=HEADERS, follow_redirects=True, timeout=60
@@ -1429,7 +1603,8 @@ async def search_rulings_fulltext(
                     resp = await client.get(html_url, timeout=35)
                     if resp.status_code == 200 and len(resp.text) > 2000:
                         if any(kw in resp.text for kw in ["P.Q.M", "FATTO", "DIRITTO", "dispositivo", "Provvedimento"]):
-                            full_text_data = _extract_ruling_text(resp.text)
+                            # Use tight cap for multi-result search (8K per ruling)
+                            full_text_data = _extract_ruling_text(resp.text, fatto_cap=8_000)
                 except Exception as e:
                     logger.warning(f"Failed to fetch ruling text from {html_url}: {e}")
 
@@ -1437,10 +1612,11 @@ async def search_rulings_fulltext(
             if full_text_data:
                 enriched_item.update({
                     "full_text_available": True,
-                    "full_text": full_text_data["full_text"],
                     "fatto_diritto": full_text_data["fatto_diritto"],
                     "dispositivo": full_text_data["dispositivo"],
                     "char_count": full_text_data["char_count"],
+                    "truncated": full_text_data["truncated"],
+                    "fatto_diritto_total_chars": full_text_data["fatto_diritto_chars"],
                 })
             else:
                 enriched_item["full_text_available"] = False
