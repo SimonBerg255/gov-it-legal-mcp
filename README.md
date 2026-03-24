@@ -18,36 +18,6 @@ Connects to:
 | `get_ruling_text` | Fetch the full text of a specific ruling from the GA portal |
 | `search_rulings_fulltext` | Topic-based search with full reasoning text extracted |
 
-## Deploy on Railway
-
-### 1. Fork this repository
-
-Click **Fork** on GitHub.
-
-### 2. Create a new Railway project
-
-1. Go to [railway.app](https://railway.app) and create a new project
-2. Choose **Deploy from GitHub repo** and select your fork
-3. In the Railway dashboard, go to **Settings → Source** and connect the environment to the `main` branch
-4. Railway will auto-detect Python and deploy using the `Procfile`
-
-### 3. Get your server URL
-
-Once deployed, Railway assigns a URL like `https://your-app.up.railway.app`. Your MCP endpoint is:
-
-```
-https://your-app.up.railway.app/mcp
-```
-
-No environment variables are required.
-
-## Connect to Intric
-
-1. In your Intric workspace, go to **Assistants → Tools → Add MCP Server**
-2. Paste your Railway URL: `https://your-app.up.railway.app/mcp`
-3. The server will appear with the Normattiva icon and all 6 tools auto-registered
-4. All tools run automatically — no confirmation prompts
-
 ## Run Locally
 
 ```bash
